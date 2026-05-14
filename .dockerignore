@@ -1,0 +1,17 @@
+__pycache__
+*.pyc
+*.pyo
+.env
+.venv
+venv/
+env/
+.git
+.gitignore
+assets/
+slicer/
+training/
+checkpoints/
+tools/
+*.npz
+data/
+sam2/_C.so

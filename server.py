@@ -1,100 +1,93 @@
-from flask import Flask, request, send_file
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import FileResponse
+import uvicorn
 import shutil
+import gc
+import torch
 from pathlib import Path
-import subprocess
-import os
+import json
+
 from infer_MedSAM2_slicer import perform_inference, improve_inference
 
-app = Flask(__name__)
+app = FastAPI(title="MedSAM2 Slicer Server")
 
-predictor_state = {}
+# Global state to hold the heavy model
+predictor_state = {
+    'predictor': None,
+    'inference_state': None
+}
 
-@app.route('/run_script', methods=['POST'])
-def run_script():
-    input_name = request.form.get('input')
-    gts_name = request.form.get('gts')
-    propagate = request.form.get('propagate') in ['y', 'Y']
-    checkpoint = 'checkpoints/%s'%(request.form.get('checkpoint'),)
-    cfg = request.form.get('config')
+def clear_memory():
+    """Forces PyTorch to release VRAM."""
+    predictor_state['predictor'] = None
+    predictor_state['inference_state'] = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    predictor, inference_state = perform_inference(checkpoint, cfg, input_name, gts_name, propagate, pred_save_dir='data/video/segs_tiny')
-    predictor_state['predictor'] = predictor
-    predictor_state['inference_state'] = inference_state
+@app.post("/unload")
+async def unload_model():
+    """Endpoint to free up the GPU for your LLM."""
+    clear_memory()
+    return {"status": "Model unloaded, VRAM cleared."}
 
-    return 'Success'
-
-    # script_parameters = [
-    #     'python',
-    #     'infer_SAM21_slicer.py',
-    #     '--cfg', 
-    #     cfg,
-    #     '--img_path',
-    #     input_name,
-    #     '--gts_path',
-    #     gts_name,
-    #     '--propagate',
-    #     propagate,
-    #     '--checkpoint',
-    #     checkpoint,
-    #     '--pred_save_dir',
-    #     'data/video/segs_tiny',
-    # ]
-
-    # process = subprocess.Popen(script_parameters, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # stdout, stderr = process.communicate()
-    # print('=================================\n', stderr, '\n=================================')
-
-    #TODO: remove custom model?
+@app.post("/segment")
+async def run_script(
+    file: UploadFile = File(...),
+    bboxes: str = Form("{}"), # Corrected to default to an empty JSON object
+    checkpoint: str = Form(...),
+    config: str = Form(...),
+    propagate: bool = Form(True)
+):
+    """Expects a .nii.gz file and spatial prompts, returns a .nii.gz mask."""
+    work_dir = Path("data/workspace")
+    work_dir.mkdir(parents=True, exist_ok=True)
     
-    # if process.returncode == 0:
-    #     return f'Success: {stdout.decode("utf-8")}'
-    # else:
-    #     return f'Error: {stderr.decode("utf-8")}'
+    input_path = work_dir / file.filename
+    output_path = work_dir / f"mask_{file.filename}"
 
-@app.route('/improve', methods=['POST'])
-def improve():
-    input_name = request.form.get('input')
+    # Save the incoming NIfTI file
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    parsed_bboxes = json.loads(bboxes)
+    ckpt_path = f"checkpoints/{checkpoint}"
 
-    predictor, inference_state = improve_inference(input_name, pred_save_dir='data/video/segs_tiny', predictor_state=predictor_state)
+    predictor, inference_state = perform_inference(
+        ckpt_path, config, str(input_path), parsed_bboxes, str(output_path), propagate=propagate
+    )
+    
     predictor_state['predictor'] = predictor
     predictor_state['inference_state'] = inference_state
 
-    return 'Success'
+    # FileResponse streams the output file directly back to the Slicer client
+    return FileResponse(path=output_path, filename=f"mask_{file.filename}")
 
+@app.post("/improve")
+async def improve(
+    file: UploadFile = File(...),
+    points: str = Form("{}") # JSON string containing 'addition' and 'subtraction' points
+):
+    work_dir = Path("data/workspace")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    
+    input_path = work_dir / file.filename
+    output_path = work_dir / f"improved_mask_{file.filename}"
 
-@app.route('/download_file', methods=['GET'])
-def download_file():
-    output_name = request.form.get('output')
-    return send_file(output_name, as_attachment=True)
+    with open(input_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    parsed_points = json.loads(points)
 
-@app.route('/upload', methods=['POST'])
-def upload_file():    
-    file = request.files['file']
+    predictor, inference_state = improve_inference(
+        str(input_path), parsed_points, str(output_path), predictor_state
+    )
+    
+    predictor_state['predictor'] = predictor
+    predictor_state['inference_state'] = inference_state
 
-    if file:
-        file.save(file.filename)
-        return 'File uploaded successfully'
-
-@app.route('/upload_model', methods=['POST'])
-def upload_model():    
-    file = request.files['file']
-    model_name = os.path.basename(file.filename).split('.')[0]
-    checkpoint_dir = "./checkpoints/%s"%model_name
-
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
-    file.save(os.path.join(checkpoint_dir, os.path.basename(file.filename)))
-    return 'Model uploaded successfully'
-
-@app.route('/upload_config', methods=['POST'])
-def upload_config():    
-    file = request.files['file']
-    config_dir = "./sam2"
-
-    Path(config_dir).mkdir(parents=True, exist_ok=True)
-
-    file.save(os.path.join(config_dir, 'custom_' + os.path.basename(file.filename)))
-    return 'Config file uploaded successfully'
+    return FileResponse(path=output_path, filename=f"improved_mask_{file.filename}")
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    # Run with uvicorn for high performance
+    uvicorn.run(app, host='0.0.0.0', port=8080)
